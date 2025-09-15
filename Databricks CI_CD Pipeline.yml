@@ -1,0 +1,239 @@
+trigger:
+  branches:
+    include:
+    - main
+    - dev
+  paths:
+    include:
+    - medallion_architecture/**
+    - tests/**
+    exclude:
+    - README.md
+variables:
+- group: dev-databricks-vars
+- name: notebookPath
+  value: "medallion_architecture"
+- name: projectName
+  value: upp_cicd
+- name: databricksCliVersion
+  value: "0.18.0"
+pool:
+  vmImage: 'ubuntu-latest'
+stages:
+- stage: Test_and_Code_Checks
+  displayName: 'Test and Code Checks'
+  jobs:
+  - job: RunTestsAndChecks
+    displayName: 'Run Tests and Code Checks'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.13'
+        addToPath: true
+      displayName: 'Set up Python'
+    - task: CmdLine@2
+      displayName: 'Install dependencies'
+      continueOnError: false
+      env:
+        DATABRICKSCLIVERSION: $(databricksCliVersion)
+      inputs:
+        script: |
+          python -m pip install --upgrade pip
+          pip install -r ./requirements.txt
+    - task: CmdLine@2
+      displayName: 'Check code formatting'
+      continueOnError: false
+      inputs:
+        script: |
+          black --check medallion_architecture
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error]Code formatting check failed"
+            exit 1
+          fi
+    - task: CmdLine@2
+      displayName: 'Run unit tests with coverage'
+      continueOnError: false
+      inputs:
+        script: |
+          cd tests/unit_tests
+          python -m coverage run -m unittest test.py
+          coverage report
+          python -m unittest test.py
+    - task: CmdLine@2
+      displayName: 'Run integration tests'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      env:
+        RESOURCE_GROUP: $(resourceGroupName)
+      inputs:
+        script: |
+          echo "Running integration tests against $RESOURCE_GROUP"
+          #pytest tests/integration_tests
+- stage: Deploy_Notebooks
+  displayName: 'Deploy Notebooks'
+  jobs:
+  - deployment: Deploy_Notebooks
+    displayName: "Deploy Databricks notebooks"
+    environment:
+      name: $(environmentName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: AzureCLI@2
+            displayName: "Resolve workspace • Install Databricks CLI • Import notebooks"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: >
+                # Fail early; enable tracing while stabilizing (remove set -x later)
+
+                set -euo pipefail
+
+                set -x
+
+
+                echo "[INFO] Enabling AZ CLI dynamic extension install (incl. preview)..."
+
+                az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
+
+                az config set extension.dynamic_install_allow_preview=true >/dev/null
+
+
+                # Parameters (Azure DevOps exposes Build.SourcesDirectory as env var BUILD_SOURCESDIRECTORY)
+
+                RESOURCE_GROUP="$(resourceGroupName)"
+
+                WORKSPACE_NAME="$(workspaceName)"
+
+                LOCAL_PATH="${BUILD_SOURCESDIRECTORY}/$(notebookPath)"
+
+                TARGET_PATH="/projects/$(projectName)"
+
+                CLEAN_FLAG="true"
+
+                CLI_VERSION="$(databricksCliVersion)"
+
+
+                echo "[INFO] Parameters:"
+
+                echo "  RG=$RESOURCE_GROUP"
+
+                echo "  WS=$WORKSPACE_NAME"
+
+                echo "  LOCAL=$LOCAL_PATH"
+
+                echo "  TARGET=$TARGET_PATH"
+
+                echo "  CLEAN=$CLEAN_FLAG"
+
+                echo "  CLI_VER=$CLI_VERSION"
+
+
+                # Ensure databricks extension exists (in case dynamic install is blocked by org policy)
+
+                az extension add --name databricks --yes || az extension update --name databricks
+
+
+                echo "[INFO] Resolving Databricks workspace URL..."
+
+                WS_URL=$(az databricks workspace show -g "$RESOURCE_GROUP" -n "$WORKSPACE_NAME" --query workspaceUrl -o tsv || true)
+
+                if [ -z "$WS_URL" ]; then
+                  echo "[ERROR] Unable to retrieve workspace URL for '$WORKSPACE_NAME' in RG '$RESOURCE_GROUP'." >&2
+                  exit 1
+                fi
+
+                HOST_URL="https://$WS_URL"
+
+                echo "[INFO] Workspace host: $HOST_URL"
+
+
+                if [ ! -d "$LOCAL_PATH" ]; then
+                  echo "[ERROR] Local notebooks folder not found: $LOCAL_PATH" >&2
+                  exit 1
+                fi
+
+
+                echo "[INFO] Ensuring 'unzip' is available (required by installer script)..."
+
+                if ! command -v unzip >/dev/null 2>&1; then
+                  sudo apt-get update -y && sudo apt-get install -y unzip
+                fi
+
+
+                echo "[INFO] Installing Databricks CLI via official installer..."
+
+                if [ "$CLI_VERSION" = "latest" ]; then
+                  INSTALL_URL="https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh"
+                else
+                  INSTALL_URL="https://raw.githubusercontent.com/databricks/setup-cli/v${CLI_VERSION}/install.sh"
+                fi
+
+
+                # Try desired version; if it fails (e.g., tag removed), fallback to latest once.
+
+                if ! curl -fsSL "$INSTALL_URL" | sh; then
+                  if [ "$CLI_VERSION" != "latest" ]; then
+                    echo "[WARN] Failed to fetch installer for v${CLI_VERSION}; falling back to latest..." >&2
+                    curl -fsSL "https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh" | sh
+                  else
+                    echo "[ERROR] Failed to install Databricks CLI from $INSTALL_URL" >&2
+                    exit 1
+                  fi
+                fi
+
+
+                # Ensure the CLI is on PATH for this shell
+
+                export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+                databricks -v || { echo "[ERROR] Databricks CLI not available on PATH" >&2; exit 1; }
+
+
+                # ===========================
+
+                # Non-interactive authentication for CI using Azure CLI context
+
+                # ===========================
+
+                echo "[INFO] Using Azure CLI context for Databricks auth (non-interactive)..."
+
+                # Make the workspace host visible to Databricks CLI
+
+                export DATABRICKS_HOST="$HOST_URL"
+
+
+                # Optional: show Azure identity for debugging service connection
+
+                az account show || true
+
+
+                echo "[INFO] Sanity check on workspace root..."
+
+                databricks workspace list / >/dev/null
+
+
+                if [ "$CLEAN_FLAG" = "true" ]; then
+                  echo "[INFO] Cleaning target workspace path: $TARGET_PATH"
+                  databricks workspace delete "$TARGET_PATH" --recursive --quiet || true
+                fi
+
+
+                echo "[INFO] Importing notebooks: $LOCAL_PATH -> $TARGET_PATH"
+
+                databricks workspace import-dir "$LOCAL_PATH" "$TARGET_PATH" --overwrite
+
+
+                # Optional: small smoke check
+
+                echo "[INFO] Listing first entries under $TARGET_PATH"
+
+                databricks workspace list "$TARGET_PATH" | sed -n '1,10p' || true
+
+
+                echo "[INFO] Deployment completed successfully."
+
